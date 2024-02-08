@@ -7,6 +7,7 @@ import { SpeechProbabilities } from "./models"
 import { Message } from "./messages"
 import { log } from "./logging"
 
+const SAMPLING_RATE = 16000
 const RECOMMENDED_FRAME_SAMPLES = [512, 1024, 1536]
 
 export interface FrameProcessorOptions {
@@ -113,9 +114,12 @@ const concatArrays = (arrays: Float32Array[]): Float32Array => {
 
 export class FrameProcessor implements FrameProcessorInterface {
   speaking: boolean = false
-  audioBuffer: { frame: Float32Array; isSpeech: boolean }[]
+  audioBuffer: { frame: Float32Array; isSpeech: boolean, prob: number }[]
   redemptionCounter = 0
   active = false
+  maxSpeechDuration: number = 10
+  maxFramesUpperBound: number
+  maxFramesLowerBound: number
 
   constructor(
     public modelProcessFunc: (
@@ -126,6 +130,10 @@ export class FrameProcessor implements FrameProcessorInterface {
   ) {
     this.audioBuffer = []
     this.reset()
+    // TODO Make `maxSpeechDuration` a passable argument to the class's constructor
+    this.maxSpeechDuration = 10
+    this.maxFramesUpperBound = Math.floor(this.maxSpeechDuration * SAMPLING_RATE / this.options.frameSamples)
+    this.maxFramesLowerBound = Math.ceil(this.maxFramesUpperBound * 0.8)
   }
 
   reset = () => {
@@ -179,7 +187,9 @@ export class FrameProcessor implements FrameProcessorInterface {
     this.audioBuffer.push({
       frame,
       isSpeech: probs.isSpeech >= this.options.positiveSpeechThreshold,
+      prob: probs.isSpeech
     })
+    const frameCount = this.audioBuffer.length
 
     if (
       probs.isSpeech >= this.options.positiveSpeechThreshold &&
@@ -196,6 +206,34 @@ export class FrameProcessor implements FrameProcessorInterface {
       return { probs, msg: Message.SpeechStart }
     }
 
+    // Limit the maximum duration of a segment
+    if (!this.audioBuffer) {
+      return {}
+    }
+    if (this.speaking && frameCount >= this.maxFramesUpperBound) {
+      const bounded_buffer = this.audioBuffer.slice(this.maxFramesLowerBound, this.maxFramesUpperBound)
+      const relative_split_index = bounded_buffer.reduce((minIndex, item, index) => {
+        const bufferProb = bounded_buffer[minIndex]?.prob || 10
+          if (item.prob < bufferProb) {
+              return index;
+              } else {
+              return minIndex;
+              }
+          }, 0)
+      const split_index = relative_split_index + this.maxFramesLowerBound;
+      const lowest_prob = this.audioBuffer[split_index]?.prob || 10
+      const segment = this.audioBuffer.slice(0, split_index)
+      this.audioBuffer = this.audioBuffer.slice(split_index, -1)
+      
+      const audio = concatArrays(segment.map((item) => item.frame));
+      const my_probs = {
+        notSpeech: 1 - lowest_prob,
+        isSpeech: lowest_prob
+      }
+      console.log("Long segment has been detected :)")
+      return { probs: my_probs, msg: Message.SpeechEnd, audio };
+    }
+    
     if (
       probs.isSpeech < this.options.negativeSpeechThreshold &&
       this.speaking &&
